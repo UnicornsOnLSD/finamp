@@ -124,6 +124,12 @@ class RemoteSessionService {
   /// The ids of the last queue pushed to the remote, used to detect when the
   /// remote reports having applied the push (see [_reflectsPushedQueue]).
   List<String> _lastPushedQueueIds = [];
+
+  /// The active session's supported commands, kept up to date independently
+  /// of [_sessionStream] (which is briefly nulled while connecting) so
+  /// [_playQueueFromIndex] can tell whether the remote can self-repeat even
+  /// during the very first push of a migrate-connect.
+  List<String>? _activeSupportedCommands;
   bool _adoptScheduled = false;
   bool _adoptInProgress = false;
 
@@ -241,6 +247,7 @@ class RemoteSessionService {
     _preConnectQueue = _queueService.captureQueueSnapshot();
 
     _activeSessionId = sessionId;
+    _activeSupportedCommands = session.supportedCommands;
     _lastKnownPositionTicks = null;
     _lastKnownItemId = null;
     _settleDeadline = null;
@@ -400,6 +407,7 @@ class RemoteSessionService {
     _settleDeadline = null;
     _adoptScheduled = false;
     _lastPushedQueueIds = [];
+    _activeSupportedCommands = null;
     _suppressAdoptUntil = DateTime.fromMillisecondsSinceEpoch(0);
     _seededVolumeLevel = null;
     _preConnectQueue = null;
@@ -474,6 +482,7 @@ class RemoteSessionService {
   }
 
   void _applySessionUpdate(SessionInfo session) {
+    _activeSupportedCommands = session.supportedCommands;
     final itemId = session.nowPlayingItem?.id.raw;
 
     // A pushed queue has settled once the remote reports playing it (or the
@@ -1011,13 +1020,25 @@ class RemoteSessionService {
   /// dropped), capped flat at [_maxTracksPerPlayNow]: several remote clients
   /// ignore a nonzero StartIndex and would start at the first sent track, so
   /// the request never relies on it.
+  ///
+  /// Exception: with repeat-one active on a remote that can't self-repeat
+  /// (see [_handleRemoteQueueEnded]), only the target track is sent. Queuing
+  /// the tracks after it would let the remote advance to the next one on its
+  /// own once the target ends, so [_handleRemoteQueueEnded] would never fire
+  /// and repeat-one would have no effect; sending just the one track makes
+  /// the remote's queue genuinely end after it, which re-triggers that path.
   Future<void> _playQueueFromIndex(int targetIndex, {Duration? startPosition}) async {
     final sessionId = _activeSessionId;
     if (sessionId == null) return;
     final fullQueue = _queueService.getQueue().fullQueue;
     if (fullQueue.isEmpty) return;
     final clampedTarget = targetIndex.clamp(0, fullQueue.length - 1);
-    final window = fullQueue.skip(clampedTarget).take(_maxTracksPerPlayNow).toList();
+    final driveRepeatOneLocally = _queueService.loopMode == FinampLoopMode.one &&
+        _activeSupportedCommands?.contains("SetRepeatMode") != true;
+    final window = fullQueue
+        .skip(clampedTarget)
+        .take(driveRepeatOneLocally ? 1 : _maxTracksPerPlayNow)
+        .toList();
     final itemIds = window.map((item) => item.baseItemId).toList();
     _lastPushedQueueIds = itemIds.map((id) => _normalizeId(id.raw)).toList();
     _settleDeadline = DateTime.now().add(const Duration(seconds: 10));
